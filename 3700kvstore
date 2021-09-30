@@ -1,0 +1,309 @@
+#!/usr/bin/env python
+import sys, socket, select, time, json, random
+
+DATASTORE = {}
+
+# Commands
+GET          = 'get'
+PUT          = 'put'
+SYNC         = 'sync'
+REDIRECT     = 'redirect'
+LEADER       = 'leader'
+VOTE         = 'vote'
+NEW_ELECTION = 'new_election'
+HEARTBEAT    = 'heartbeat'
+SYNC_CONFIRMED  = 'sync_confirmed'
+
+# some states
+LEADER_STATE    = 'LEADER'
+FOLLOWER_STATE  = 'FOLLOWER'
+CANDIDATE_STATE = 'CANDIDATE'
+WAIT_FOR_SYNC   = 'WAIT_FOR_SYNC'
+SYNC_OK         = 'SYNC_OK'
+
+SRC   = 'src'
+DST   = 'dst'
+OK    = 'ok'
+FAIL  = 'fail'
+TYPE  = 'type'
+KEY   = 'key'
+VALUE = 'value'
+TERM  = 'term'
+
+BROADCAST = 'FFFF'
+
+class DataStoreInfo:
+	VALUE = ''
+	#SYNC_STATE = WAIT_FOR_SYNC;
+	SYNC_STATE = SYNC_OK; # TEMP
+	SYNC_CNT   = 0
+
+class Info:
+	TERM_NUMBER  = 0 # increment after each election
+	NUM_VOTES    = 0 # how many votes do I have
+	MSG          = {}
+	SYNC_OK_MSG  = {}
+	STATE        = FOLLOWER_STATE
+	MY_ID        = ""
+	REPLICA_IDS  = []
+	LEADER_ID    = BROADCAST
+
+	MAJORITY_VOTES = 0 # how many votes needed to win
+	LAST_ELECTION  = 0.0
+	LAST_HEARTBEAT = 0.0
+
+def handle_heartbeat(info):
+        #print time.time(), info.MY_ID, "GOT HEARTBEATS"
+	info.LAST_ELECTION = time.time() 
+
+
+def handle_sync(info):
+	#print "REPLICA DATASTORE", info.MY_ID, info.MSG[KEY], info.MSG[VALUE]
+
+	dbinfo = DataStoreInfo()
+	dbinfo.VALUE = info.MSG[VALUE]
+	dbinfo.SYNC_STATE = SYNC_OK
+
+	DATASTORE[info.MSG[KEY]] = dbinfo
+
+	#src = info.MSG[SRC]
+	#dst = info.MSG[DST]
+
+	#info.MSG[SRC] = dst
+	#info.MSG[DST] = src
+	#info.MSG[TYPE] = SYNC_CONFIRMED
+	#info.sock.send(json.dumps(info.MSG))
+
+def handle_sync_confirmed(info):
+	if info.MSG[KEY] in DATASTORE:
+		if DATASTORE[info.MSG[KEY]].SYNC_STATE == WAIT_FOR_SYNC:
+			#print WAIT_FOR_SYNC
+			DATASTORE[info.MSG[KEY]].SYNC_CNT = DATASTORE[info.MSG[KEY]].SYNC_CNT + 1
+			if DATASTORE[info.MSG[KEY]].SYNC_CNT >= info.MAJORITY_VOTES:
+				DATASTORE[info.MSG[KEY]].SYNC_STATE = SYNC_OK
+				info.sock.send(json.dumps(info.SYNC_OK_MSG))
+		else: # TEMP
+			#print "SYNC OK SEND"
+			info.sock.send(json.dumps(info.SYNC_OK_MSG))
+
+def handle_put(info):
+	src = info.MSG[SRC]
+	dst = info.MSG[DST]
+
+	info.MSG[SRC] = dst
+	info.MSG[DST] = src
+
+	#print "GLOBAL DATASTORE", info.MSG[KEY], info.MSG[VALUE]
+
+	if info.STATE != LEADER_STATE:
+		info.MSG[TYPE] = REDIRECT
+		info.MSG[LEADER] = info.LEADER_ID
+		info.sock.send(json.dumps(info.MSG))
+		return
+
+	# if the same key and value exist in LEADER get out do 
+	# not waste messages
+	if info.MSG[KEY] in DATASTORE:
+		if info.MSG[VALUE] == DATASTORE[info.MSG[KEY]].VALUE:
+			info.MSG[DST] = src
+			info.MSG[SRC] = dst
+			info.MSG[TYPE] = OK
+			#print "OK"
+			info.sock.send(json.dumps(info.MSG))
+			return
+
+	dbinfo = DataStoreInfo()
+	dbinfo.VALUE = info.MSG[VALUE]
+	
+	DATASTORE[info.MSG[KEY]] = dbinfo
+	#print time.time(), "LEADER DATASTORE", info.MY_ID, info.MSG[KEY], info.MSG[VALUE]
+
+	info.MSG[TYPE] = SYNC 
+	info.MSG[DST]  = BROADCAST
+	info.MSG[SRC]  = info.MY_ID
+	info.MSG[LEADER]  = info.MY_ID
+	try:
+		sync_msg = info.MSG	
+		info.sock.send(json.dumps(sync_msg))
+	except:
+		print "SOCK ERR"
+
+	time.sleep(.00025)
+
+	info.MSG[DST] = src
+	info.MSG[SRC] = dst
+	info.MSG[TYPE] = OK
+
+	#send this after we get majority sync confirms
+	info.SYNC_OK_MSG = info.MSG 
+	info.sock.send(json.dumps(info.SYNC_OK_MSG))
+
+
+
+def handle_get(info):
+	src = info.MSG[SRC]
+	dst = info.MSG[DST]
+
+	#print "GET", info.MY_ID, src,  dst
+
+	info.MSG[SRC] = dst
+	info.MSG[DST] = src
+
+	if info.STATE != LEADER_STATE:
+		info.MSG[TYPE] = REDIRECT
+		info.MSG[LEADER] = info.LEADER_ID
+		info.sock.send(json.dumps(info.MSG))
+		return
+
+	info.MSG[TYPE] = OK
+	if info.MSG[KEY] in DATASTORE and DATASTORE[info.MSG[KEY]].SYNC_STATE == SYNC_OK:
+		info.MSG[VALUE] = DATASTORE[info.MSG[KEY]].VALUE
+	else:
+		# print FAIL, DATASTORE[info.MSG[KEY]].SYNC_STATE == SYNC_OK, info.MSG[KEY] in DATASTORE
+		info.MSG[TYPE] = FAIL
+		info.MSG[VALUE] = ''
+
+	#print "OK"
+	info.MSG[LEADER] = info.MY_ID
+	info.sock.send(json.dumps(info.MSG))
+
+def send_heartbeat_to_replicas(info):
+	# only the leader sends HB messages
+	if info.STATE == LEADER_STATE:
+		#print time.time(), info.MY_ID, "SEND THE HEARTBEATS"
+		for r in info.REPLICA_IDS:
+			hb_msg = {SRC:    info.MY_ID, \
+			  	DST:    r,   \
+		          	LEADER: info.MY_ID, \
+		          	TYPE:   HEARTBEAT,  \
+	                  	TERM:   info.TERM_NUMBER}
+			info.sock.send(json.dumps(hb_msg))
+
+def start_election(info):
+	for r in info.REPLICA_IDS:
+		election_msg = {SRC:    info.MY_ID,  \
+	                        DST:    r,           \
+	                        LEADER: BROADCAST,   \
+	                        TYPE:   NEW_ELECTION,\
+	                        TERM:   info.TERM_NUMBER}
+		info.sock.send(json.dumps(election_msg))
+
+def send_vote(info):
+	vote_msg = {SRC: info.MY_ID,    \
+	            DST: info.MSG[SRC], \
+	            LEADER : BROADCAST, \
+	            TYPE: VOTE, \
+	            TERM: info.TERM_NUMBER}
+	info.sock.send(json.dumps(vote_msg))
+	info.LAST_ELECTION = time.time()
+
+def send_new_leader(info):
+	for r in info.REPLICA_IDS:
+		leader_msg = {SRC: info.MY_ID,     \
+			      DST: r,              \
+			      LEADER : info.MY_ID, \
+			      TYPE: LEADER,        \
+		              TERM: info.TERM_NUMBER}
+		info.sock.send(json.dumps(leader_msg))
+	
+	
+
+def main():
+	info = Info()
+
+	# Your ID number
+	info.MY_ID = sys.argv[1]
+
+	# The ID numbers of all the other replicas
+	info.REPLICA_IDS = sys.argv[2:]
+
+
+	info.MAJORITY_VOTES = (len(info.REPLICA_IDS) + 1) / 2 + 1 
+	info.ELECTION_TIMEOUT = random.uniform(1.0, 3.0)
+	info.HEARTBEAT_INTERVAL = .5
+
+	# Connect to the network. All messages to/from other replicas and clients will
+	# occur over this socket
+	info.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+	info.sock.connect(info.MY_ID)
+
+	info.LAST_ELECTION = time.time()
+	info.LAST_HEARTBEAT = time.time()
+
+	while True:
+		ready = select.select([info.sock], [], [], 0.001)[0]
+	
+		msg_raw = ''
+		if info.sock in ready:
+			msg_raw = info.sock.recv(32768)
+		
+			if len(msg_raw) == 0: 
+				continue
+
+			info.MSG = json.loads(msg_raw)
+			#print time.time(), info.MY_ID, info.STATE, info.MSG
+
+		if len(msg_raw) > 0: 
+
+			if info.MSG[TYPE] == GET:
+				# do not process a new get message until synched
+				handle_get(info)
+			elif info.MSG[TYPE] == PUT:
+                       		handle_put(info)
+			elif info.MSG[TYPE] == SYNC:
+                        	handle_sync(info)
+			elif info.MSG[TYPE] == HEARTBEAT:
+                        	handle_heartbeat(info)
+			elif info.MSG[TYPE] == VOTE:
+				if info.STATE == CANDIDATE_STATE:
+					info.NUM_VOTES = info.NUM_VOTES + 1
+					if info.NUM_VOTES >= info.MAJORITY_VOTES:
+						# print time.time(), "WINNING LEADER", info.MY_ID
+						info.STATE = LEADER_STATE
+						send_new_leader(info)
+						info.LEADER_ID = info.MY_ID
+						info.NUM_VOTES = 0
+						info.LAST_ELECTION = time.time()
+						info.SYNC_STATE = SYNC_OK
+						info.LAST_HEARTBEAT = time.time()
+					else:
+						pass
+	
+			elif info.MSG[TYPE] == LEADER:
+				# need to add validation of TERM 
+				# need to handle race condition of 2 elections
+				info.STATE = FOLLOWER_STATE
+				info.NUM_VOTES = 0
+				info.LEADER_ID = info.MSG[LEADER]
+				info.LAST_ELECTION = time.time()
+				#print "GOT LEADER", info.MY_ID, time.time()
+			elif info.MSG[TYPE] == NEW_ELECTION:
+				# in progress so do not start another
+				info.LAST_ELECTION = time.time() 
+				info.LEADER_ID = BROADCAST
+				info.STATE = FOLLOWER_STATE
+				send_vote(info)	
+			elif info.MSG[TYPE] == SYNC_CONFIRMED:
+				handle_sync_confirmed(info)
+
+		clock = time.time()
+
+		if info.STATE == LEADER_STATE:
+			if clock - info.LAST_HEARTBEAT > info.HEARTBEAT_INTERVAL:
+				send_heartbeat_to_replicas(info)
+				info.LAST_HEARTBEAT = clock
+
+		if info.STATE != LEADER_STATE:
+			if clock - info.LAST_ELECTION > info.ELECTION_TIMEOUT:
+				# print time.time(), info.MY_ID, "ELECTION TIMEOUT"
+				if info.STATE == FOLLOWER_STATE or info.STATE == LEADER_STATE:
+					info.TERM_NUMBER = info.TERM_NUMBER + 1
+					info.STATE = CANDIDATE_STATE
+					info.NUM_VOTES = 1 # election started
+					info.LEADER_ID = BROADCAST
+					start_election(info)
+				info.LAST_ELECTION = clock
+		
+
+if __name__ == "__main__":
+	main()
